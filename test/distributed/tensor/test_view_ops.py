@@ -2134,6 +2134,64 @@ class TestViewOps(DTensorContinuousTestBase):
         )
         self.assertEqual(out_plc, [Replicate(), Replicate()])
 
+    def test_view_flatten_split_strided_shard(self):
+        mesh = init_device_mesh(self.device_type, (2, self.world_size // 2))
+
+        # (input_shape, view_shape, expected_placements)
+        cases = [
+            # (4,4,4) → (8,8): strided along dim 0, same dim but missing stride
+            (
+                (4, 4, 4),
+                (8, 8),
+                (_StridedShard(dim=0, split_factor=4), Replicate()),
+            ),
+            # (8,4) → (4,4,2): strided along dim 1, wrong dim entirely
+            (
+                (8, 4),
+                (4, 4, 2),
+                (_StridedShard(dim=1, split_factor=2), Replicate()),
+            ),
+        ]
+
+        for input_shape, view_shape, expected_placements in cases:
+            with self.subTest(input=input_shape, view=view_shape):
+                nelem = math.prod(input_shape)
+                full = (
+                    torch.arange(nelem, device=self.device_type)
+                    .float()
+                    .view(input_shape)
+                )
+                dt = distribute_tensor(full, mesh, [Shard(1), Replicate()])
+
+                # Prove expected placements are correct:
+                # 1) full_tensor() round-trips to single-device ground truth
+                # 2) local tensor matches what the input actually holds
+                expected_dt = distribute_tensor(
+                    full.view(view_shape), mesh, expected_placements, src_data_rank=None
+                )
+                self.assertEqual(expected_dt.full_tensor(), full.view(view_shape))
+                self.assertEqual(
+                    expected_dt._local_tensor,
+                    dt._local_tensor.view(expected_dt._local_tensor.shape),
+                )
+
+                # Check the actual view op output
+                comm_mode = CommDebugMode()
+                with comm_mode:
+                    out = dt.view(view_shape)
+                self.assertEqual(comm_mode.get_total_counts(), 0)
+                self.assertEqual(out.placements, expected_placements)
+
+    def test_view_flatten_split_unrepresentable(self):
+        # (12,8) → (16,6) with Shard(1): the strided pattern (period=8)
+        # can't be represented in group_shape (16,6), so view() must error
+        # instead of silently producing wrong data.
+        mesh = init_device_mesh(self.device_type, (self.world_size,))
+        full = torch.randn(12, 8, device=self.device_type)
+        dt = distribute_tensor(full, mesh, [Shard(1)])
+        with self.assertRaises(RuntimeError):
+            dt.view(16, 6)
+
     def test_input_dim_rejects_int_comparison(self):
         """InputDim.__eq__ should raise TypeError when compared with int.
 
